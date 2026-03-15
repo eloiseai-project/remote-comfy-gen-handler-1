@@ -1,11 +1,18 @@
-"""Query ComfyUI for available samplers, schedulers, and node info.
+"""Query ComfyUI for available samplers, schedulers, and LoRA models.
 
-Hits the local ComfyUI /object_info endpoint and extracts useful metadata.
+Consolidated endpoint that returns all dynamic values needed by frontends.
+These values are consolidated into a single command because they are dynamic
+options that the BlockFlow UI needs to populate dropdowns and selectors.
+
+Hits the local ComfyUI /object_info endpoint for samplers/schedulers,
+and scans the filesystem for available LoRA files.
 """
 
 import json
 import os
 import urllib.request
+
+import list_handler
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_URL = f"http://{COMFY_HOST}"
@@ -32,6 +39,9 @@ def _extract_enum_options(node_info: dict, field_name: str) -> list[str]:
 def handle(job: dict) -> dict:
     """Handle a query_info command.
 
+    Returns samplers, schedulers, and LoRA files in a single response.
+    Consolidated because these are all dynamic values updated in the BlockFlow UI.
+
     Expected input:
     {
         "command": "query_info"
@@ -42,6 +52,7 @@ def handle(job: dict) -> dict:
         "ok": true,
         "samplers": ["euler", "euler_ancestral", ...],
         "schedulers": ["normal", "karras", ...],
+        "loras": [{"filename": "...", "path": "...", "size_mb": ...}, ...]
     }
     """
     try:
@@ -54,8 +65,13 @@ def handle(job: dict) -> dict:
     samplers = _extract_enum_options(ksampler, "sampler_name")
     schedulers = _extract_enum_options(ksampler, "scheduler")
 
+    # List available LoRA files using shared listing logic
+    lora_result = list_handler.handle({"input": {"model_type": "loras"}})
+    loras = lora_result.get("files", [])
+
     return {
         "ok": True,
         "samplers": samplers,
         "schedulers": schedulers,
+        "loras": loras,
     }
