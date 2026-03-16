@@ -551,14 +551,6 @@ def handler(job: dict) -> dict:
     try:
         _send_progress(job, "init", "Preparing job", percent=0)
 
-        # --- Start model hashing in background ---
-        hash_result = {}
-        hash_thread = threading.Thread(
-            target=lambda: hash_result.update(_compute_model_hashes(workflow)),
-            daemon=True,
-        )
-        hash_thread.start()
-
         # --- Step 1: Download input files and patch workflow ---
         _send_progress(job, "download_inputs", "Downloading input files", percent=5)
         for node_id, file_info in file_inputs.items():
@@ -581,6 +573,14 @@ def handler(job: dict) -> dict:
         for node_id, params in overrides.items():
             if node_id in workflow:
                 workflow[node_id]["inputs"].update(params)
+
+        # --- Start model hashing in background (after overrides applied) ---
+        hash_result = {}
+        hash_thread = threading.Thread(
+            target=lambda: hash_result.update(_compute_model_hashes(workflow)),
+            daemon=True,
+        )
+        hash_thread.start()
 
         # --- Step 2b: Check all referenced models exist on disk ---
         missing_models = _check_models_exist(workflow)
