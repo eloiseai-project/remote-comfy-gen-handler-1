@@ -314,7 +314,7 @@ def _scan_all_model_refs(workflow: dict) -> list[str]:
         for field, value in inputs.items():
             if not isinstance(value, str):
                 continue
-            if not field.endswith("_name"):
+            if "_name" not in field:
                 continue
             if not value.lower().endswith(MODEL_EXTENSIONS):
                 continue
