@@ -40,11 +40,19 @@ fi
 
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
+# Experimental performance flags (enable via EXPERIMENTAL=true env var)
+PERF_FLAGS=""
+if [ "${EXPERIMENTAL}" = "true" ]; then
+    echo "[start] Experimental mode: enabling fp8_matrix_mult, cublas_ops, flash-attention, gpu-only"
+    PERF_FLAGS="--fast fp8_matrix_mult cublas_ops --gpu-only --use-flash-attention"
+fi
+
 python3 main.py \
     --listen 0.0.0.0 \
     --port $COMFYUI_PORT \
     --disable-auto-launch \
     --disable-metadata \
+    $PERF_FLAGS \
     $EXTRA_PATHS_FLAG \
     > >(tee "$COMFY_LOG") 2>&1 &
 
