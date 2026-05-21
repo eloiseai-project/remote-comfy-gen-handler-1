@@ -5,8 +5,20 @@ Handles two download sources:
 - Direct URL: Uses aria2c to download from any URL (HuggingFace, etc.)
 
 Files are downloaded to /runpod-volume/ComfyUI/models/<dest>/.
+
+SHA256 verification + content-addressable dedup:
+Each entry may include an optional `sha256` field. When present:
+- If a file already exists at the destination and its hash matches, the
+  download is skipped and the result includes `cached: true`.
+- Otherwise the file is downloaded and its hash verified post-download. On
+  mismatch the corrupt file is deleted and the job fails.
+
+`destination_path` may be used as a synonym for `dest` + `filename`. It is a
+relative path under MODELS_BASE — e.g. `"loras/sub/m.safetensors"` resolves to
+`/runpod-volume/ComfyUI/models/loras/sub/m.safetensors`.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -16,6 +28,30 @@ import runpod
 
 MODELS_BASE = "/runpod-volume/ComfyUI/models"
 CIVITAI_SCRIPT = "/tools/civitai-downloader/download_with_aria.py"
+
+
+def _sha256_file(path: str) -> str:
+    """Compute SHA256 of a file, reading in 64 KiB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _split_destination_path(destination_path: str) -> tuple[str, str]:
+    """Split a `destination_path` into (dest_subdir, filename).
+
+    `destination_path` is relative to MODELS_BASE (e.g. "loras/sub/m.safetensors").
+    Leading slashes and ".." segments are stripped to keep writes confined.
+    """
+    cleaned = destination_path.lstrip("/").replace("\\", "/")
+    parts = [p for p in cleaned.split("/") if p and p != ".."]
+    if not parts:
+        raise RuntimeError(f"destination_path is empty after normalization: {destination_path!r}")
+    filename = parts[-1]
+    dest = "/".join(parts[:-1]) if len(parts) > 1 else ""
+    return dest, filename
 
 
 def _send_progress(job: dict, message: str, percent: float = 0) -> None:
@@ -190,6 +226,20 @@ def _download_url(
     }
 
 
+def _resolve_target(dl: dict) -> tuple[str, str]:
+    """Resolve (dest_subdir, filename) from a download entry.
+
+    Supports two shapes:
+    - `dest` + (optional) `filename` (ComfyGen native — filename may be derived
+      from the URL at download time when None)
+    - `destination_path` (BlockFlow preset manifest synonym)
+    """
+    if "destination_path" in dl and dl["destination_path"]:
+        return _split_destination_path(dl["destination_path"])
+    dest = dl.get("dest", "checkpoints")
+    return dest, dl.get("filename")
+
+
 def handle(job: dict) -> dict:
     """Handle a download command job.
 
@@ -198,15 +248,29 @@ def handle(job: dict) -> dict:
         "command": "download",
         "downloads": [
             {"source": "civitai", "version_id": "12345", "dest": "loras"},
-            {"source": "url", "url": "https://...", "dest": "checkpoints", "filename": "model.safetensors"}
+            {"source": "url", "url": "https://...", "dest": "checkpoints",
+             "filename": "model.safetensors", "sha256": "<optional hex>"},
+            {"source": "url", "url": "https://...",
+             "destination_path": "loras/sub/m.safetensors", "sha256": "<hex>"}
         ]
     }
+
+    `sha256` (optional, per entry): if present, the post-download hash is
+    verified. A mismatch fails the job and removes the corrupt file. If a file
+    already exists at the destination with the matching hash, aria2c is not
+    invoked and the entry is reported with `cached: true`.
+
+    `destination_path` (optional, per entry): synonym for `dest` + `filename`,
+    interpreted relative to MODELS_BASE. Used by BlockFlow's preset manifest.
 
     Returns:
     {
         "ok": true,
         "files": [
-            {"filename": "...", "dest": "loras", "path": "...", "size_mb": 123.4}
+            {"filename": "...", "dest": "loras", "path": "...",
+             "size_mb": 123.4, "bytes": 129500000,
+             "sha256": "<hex>",     # present iff caller supplied sha256
+             "cached": false}       # true if served from existing file
         ]
     }
     """
@@ -228,8 +292,9 @@ def handle(job: dict) -> dict:
 
     for i, dl in enumerate(downloads):
         source = dl.get("source", "")
-        dest = dl.get("dest", "checkpoints")
+        dest, override_filename = _resolve_target(dl)
         dest_dir = os.path.join(MODELS_BASE, dest)
+        expected_sha = dl.get("sha256")
 
         pct = (i / len(downloads)) * 100
         _send_progress(job, f"Downloading {i+1}/{len(downloads)}", percent=pct)
@@ -240,24 +305,61 @@ def handle(job: dict) -> dict:
                 raise RuntimeError(f"Download {i+1}: 'version_id' required for civitai source")
             print(f"[job {job_id[:8]}] CivitAI download: version {version_id} -> {dest}")
             info = _download_civitai(str(version_id), dest_dir)
+            cached = False
 
         elif source == "url":
             url = dl.get("url")
             if not url:
                 raise RuntimeError(f"Download {i+1}: 'url' required for url source")
-            filename = dl.get("filename")
-            print(f"[job {job_id[:8]}] URL download: {url} -> {dest}")
-            info = _download_url(
-                url, dest_dir, filename,
-                job=job, item_index=i, total_items=len(downloads),
-            )
+            filename = override_filename
+            if not filename:
+                filename = url.rstrip("/").rsplit("/", 1)[-1]
+                if "?" in filename:
+                    filename = filename.split("?")[0]
+            target_path = os.path.join(dest_dir, filename)
+
+            # Content-addressable dedup: if a file already exists at the target
+            # with the expected hash, skip aria2c entirely.
+            cached = False
+            if expected_sha and os.path.isfile(target_path):
+                existing_sha = _sha256_file(target_path)
+                if existing_sha == expected_sha:
+                    cached = True
+                    size_mb = round(os.path.getsize(target_path) / (1024 * 1024), 1)
+                    info = {"filename": filename, "path": target_path, "size_mb": size_mb}
+                    print(f"[job {job_id[:8]}] Cached: {filename} (sha256 match)")
+
+            if not cached:
+                print(f"[job {job_id[:8]}] URL download: {url} -> {dest}/{filename}")
+                info = _download_url(
+                    url, dest_dir, filename,
+                    job=job, item_index=i, total_items=len(downloads),
+                )
 
         else:
             raise RuntimeError(f"Download {i+1}: unknown source '{source}'. Use 'civitai' or 'url'.")
 
+        # Post-download sha256 verification (skip if we just confirmed via cache).
+        if expected_sha and not cached:
+            actual_sha = _sha256_file(info["path"])
+            if actual_sha != expected_sha:
+                try:
+                    os.unlink(info["path"])
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Download {i+1}: sha256 mismatch for {info['filename']}: "
+                    f"expected {expected_sha}, got {actual_sha}. Corrupt file removed."
+                )
+            info["sha256"] = actual_sha
+        elif expected_sha and cached:
+            info["sha256"] = expected_sha
+
         info["dest"] = dest
+        info["cached"] = cached
+        info["bytes"] = os.path.getsize(info["path"])
         results.append(info)
-        print(f"[job {job_id[:8]}] Downloaded: {info['filename']} ({info['size_mb']} MB)")
+        print(f"[job {job_id[:8]}] Downloaded: {info['filename']} ({info['size_mb']} MB, cached={cached})")
 
     elapsed = int(time.time() - start_time)
     _send_progress(job, f"Done — {len(results)} file(s) in {elapsed}s", percent=100)

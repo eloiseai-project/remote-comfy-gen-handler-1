@@ -624,6 +624,15 @@ def handler(job: dict) -> dict:
     if command == "query_info":
         import info_handler
         return info_handler.handle(job)
+    if command == "health":
+        import health_handler
+        return health_handler.handle(job)
+    if command == "delete":
+        import delete_handler
+        return delete_handler.handle(job)
+    if command == "volume_info":
+        import volume_info_handler
+        return volume_info_handler.handle(job)
 
     start_time = time.time()
     job_id = job.get("id", "unknown")
