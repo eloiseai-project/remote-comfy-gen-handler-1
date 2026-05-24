@@ -26,7 +26,9 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -248,21 +250,40 @@ async def handle_shutdown(request: web.Request) -> web.Response:
 
 
 async def _self_terminate(pod_id: str | None, api_key: str | None) -> None:
+    """Best-effort in-pod DELETE + Python exit.
+
+    This is NOT the canonical teardown — RunPod restarts the container after
+    the Python process exits, and the DELETE attempted here has been seen to
+    fail silently. The orchestrator (comfy-gen install-preset) issues its own
+    DELETE from outside; this is just defense-in-depth for the install-call
+    case where the orchestrator may not be present long enough to clean up.
+    """
     await asyncio.sleep(SHUTDOWN_DELAY_SEC)
     if api_key and pod_id:
         url = f"https://rest.runpod.io/v1/pods/{pod_id}"
         req = urllib.request.Request(
             url, method="DELETE",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "comfygen-installer/0.2",
+            },
         )
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, lambda: urllib.request.urlopen(req, timeout=15).read()
             )
-        except Exception:
-            # Caller is responsible for deletion if our self-DELETE fails.
-            pass
-    # Either way, exit so the container dies even when RUNPOD_API_KEY is unset.
+            print(f"[installer_server] in-pod DELETE /v1/pods/{pod_id} succeeded",
+                  file=sys.stderr, flush=True)
+        except urllib.error.HTTPError as exc:
+            print(f"[installer_server] in-pod DELETE failed HTTP {exc.code}: "
+                  f"{exc.read().decode(errors='replace')[:200]}",
+                  file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[installer_server] in-pod DELETE failed: "
+                  f"{type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+    # Exit so the Python process drains. Note: RunPod will restart the
+    # container — the orchestrator's DELETE is what actually stops billing.
     os._exit(0)
 
 
