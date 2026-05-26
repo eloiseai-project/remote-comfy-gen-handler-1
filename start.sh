@@ -6,6 +6,14 @@ COMFYUI_PORT=8188
 RUNTIME_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMFY_LOG="/tmp/comfyui_startup.log"
 
+# Stamp the runtime commit at every boot so we can tell from the worker log
+# which SHA is actually running. Critical when diagnosing FlashBoot snapshots
+# vs true cold starts (per bead 6i0).
+RUNTIME_SHA="$(git -C "$RUNTIME_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+RUNTIME_SUBJ="$(git -C "$RUNTIME_DIR" log -1 --pretty=%s 2>/dev/null || echo '?')"
+echo "[start] runtime commit ${RUNTIME_SHA}: ${RUNTIME_SUBJ}"
+export RUNTIME_COMMIT="${RUNTIME_SHA}: ${RUNTIME_SUBJ}"
+
 echo "[start] Booting ComfyUI from $COMFYUI_DIR (baked in image)..."
 
 # Verify ComfyUI exists

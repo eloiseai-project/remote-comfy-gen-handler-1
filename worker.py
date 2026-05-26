@@ -23,6 +23,33 @@ import storage
 from log_forwarder import log
 
 
+# Stamp the runtime commit at module-import time so we can tell which SHA a
+# worker is actually running. start.sh exports RUNTIME_COMMIT during boot;
+# fall back to git rev-parse if it's not set (e.g. FlashBoot resume restored
+# a Python process without re-running start.sh). See bead 6i0.
+def _resolve_runtime_commit() -> str:
+    env = os.environ.get("RUNTIME_COMMIT")
+    if env:
+        return env
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sha = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        subj = subprocess.check_output(
+            ["git", "-C", here, "log", "-1", "--pretty=%s"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        return f"{sha}: {subj}"
+    except Exception:
+        return "unknown"
+
+
+RUNTIME_COMMIT = _resolve_runtime_commit()
+print(f"[worker] loaded runtime commit {RUNTIME_COMMIT}", flush=True)
+
+
 # --- Model hash cache (persisted on network volume) ---
 _HASH_CACHE_PATH = "/runpod-volume/.model-hash-cache.json"
 _hash_cache: dict[str, dict] = {}  # {path: {sha256, size, mtime}}
@@ -611,6 +638,12 @@ def handler(job: dict) -> dict:
         "model_hashes": {"file.safetensors": {"sha256": "...", "type": "checkpoints"}}
     }
     """
+    # Per-job commit stamp — survives FlashBoot snapshots. The SHA printed
+    # here is whatever code is *actually loaded* in this Python process, not
+    # what's on disk. Pair with start.sh's [start] runtime commit … line to
+    # detect snapshot-vs-disk drift (bead 6i0).
+    print(f"[job {(job.get('id') or 'unknown')[:8]}] runtime commit {RUNTIME_COMMIT}", flush=True)
+
     job_input = job["input"]
 
     # Dispatch non-workflow commands to separate handlers
