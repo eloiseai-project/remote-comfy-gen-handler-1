@@ -493,15 +493,42 @@ def _get_manager_model_list() -> dict[str, dict]:
         return {}
 
 
-def _check_models_exist(workflow: dict) -> list[dict]:
+# Models that custom nodes fetch on first use, so a missing file on the volume
+# is not a blocking precondition. Keep this list narrow: only models that a
+# well-behaved node guarantees to auto-download. Anything else should be in the
+# preset manifest. Extendable at deploy time via COMFY_GEN_IGNORE_MISSING_MODELS
+# (comma-separated filenames). Per bead xud.
+_AUTO_DOWNLOADED_MODELS_DEFAULT = frozenset({
+    # ComfyUI-Frame-Interpolation (RIFE) — downloads from huggingface on load
+    "rife40.pth", "rife41.pth", "rife42.pth", "rife43.pth", "rife44.pth",
+    "rife45.pth", "rife46.pth", "rife47.pth", "rife48.pth", "rife49.pth",
+})
+
+
+def _auto_downloaded_models() -> frozenset[str]:
+    """Filenames considered runtime-auto-downloaded — excluded from the
+    missing-models preflight. Combines built-in defaults with the
+    COMFY_GEN_IGNORE_MISSING_MODELS env var (comma-separated)."""
+    extra_env = os.environ.get("COMFY_GEN_IGNORE_MISSING_MODELS", "")
+    extra = {s.strip() for s in extra_env.split(",") if s.strip()}
+    return _AUTO_DOWNLOADED_MODELS_DEFAULT | frozenset(extra)
+
+
+def _check_models_exist(workflow: dict) -> tuple[list[dict], list[dict]]:
     """Check that all model files referenced in the workflow exist on disk.
 
-    Returns list of missing model dicts with download info where available.
-    Empty list means all models found.
+    Returns (missing, auto_downloaded):
+      - missing: blocking absences — caller should fail the job
+      - auto_downloaded: allowlisted runtime-auto-downloaded files that are
+        absent but expected to fetch themselves. Surfaced for visibility, not
+        a failure condition.
+    Both lists are empty if every model is on disk.
     """
     refs = _scan_all_model_refs(workflow)
-    missing = []
-    seen = set()
+    missing: list[dict] = []
+    auto_downloaded: list[dict] = []
+    seen: set[str] = set()
+    allowlist = _auto_downloaded_models()
 
     # Lazy-load the Manager model list only if we find missing models
     manager_models = None
@@ -515,16 +542,20 @@ def _check_models_exist(workflow: dict) -> list[dict]:
         if _resolve_model_path(filename) is not None:
             continue
 
-        # Model is missing — look up download info
-        if manager_models is None:
-            manager_models = _get_manager_model_list()
-
         entry = {
             "filename": filename,
             "input_field": ref["input_field"],
             "node_id": ref["node_id"],
             "class_type": ref["class_type"],
         }
+
+        if filename in allowlist:
+            auto_downloaded.append(entry)
+            continue
+
+        # Model is missing — look up download info
+        if manager_models is None:
+            manager_models = _get_manager_model_list()
 
         dl_info = manager_models.get(filename)
         if dl_info:
@@ -534,7 +565,7 @@ def _check_models_exist(workflow: dict) -> list[dict]:
 
         missing.append(entry)
 
-    return missing
+    return missing, auto_downloaded
 
 
 # --- Error formatting ---
@@ -728,7 +759,10 @@ def handler(job: dict) -> dict:
         hash_thread.start()
 
         # --- Step 2b: Check all referenced models exist on disk ---
-        missing_models = _check_models_exist(workflow)
+        missing_models, auto_downloaded_models = _check_models_exist(workflow)
+        if auto_downloaded_models:
+            names = ", ".join(m["filename"] for m in auto_downloaded_models)
+            jlog.info(f"Auto-downloaded at runtime (skipping preflight): {names}")
         if missing_models:
             names = ", ".join(m["filename"] for m in missing_models)
             jlog.error(f"Missing models: {names}")
@@ -740,6 +774,7 @@ def handler(job: dict) -> dict:
                 "error_message": f"Missing {len(missing_models)} model(s) on network volume: {names}",
                 "missing_models": missing_models,
                 "downloadable_count": len(downloadable),
+                "auto_downloaded_models": auto_downloaded_models,
             }
 
         # --- Step 3: Pre-flight check for missing custom nodes ---
