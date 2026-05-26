@@ -68,12 +68,14 @@ def _send_progress(job: dict, message: str, percent: float = 0) -> None:
         pass
 
 
-def _download_civitai(version_id: str, dest_dir: str) -> dict:
+def _download_civitai(version_id: str, dest_dir: str, timeout_sec: int = 600) -> dict:
     """Download a model from CivitAI using download_with_aria.py.
 
     Args:
         version_id: CivitAI model version ID.
         dest_dir: Absolute path to destination directory.
+        timeout_sec: Subprocess timeout. Orchestrator-controlled per job
+            (BlockFlow computes ~`300 + size_gb * 60`); 600 is a safe minimum.
 
     Returns:
         Dict with filename, path, size_mb.
@@ -87,7 +89,7 @@ def _download_civitai(version_id: str, dest_dir: str) -> dict:
         ["python3", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=timeout_sec,
     )
 
     if result.returncode != 0:
@@ -146,6 +148,7 @@ def _download_url(
     item_index: int = 0,
     total_items: int = 1,
     progress_callback: Callable[[dict], None] | None = None,
+    timeout_sec: int = 600,
 ) -> dict:
     """Download a file from a direct URL using aria2c with progress streaming.
 
@@ -216,7 +219,7 @@ def _download_url(
     except Exception:
         pass
 
-    proc.wait(timeout=600)
+    proc.wait(timeout=timeout_sec)
 
     if proc.returncode != 0:
         full_output = "".join(output_lines).strip()
@@ -315,6 +318,13 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
     if civitai_token:
         os.environ["CIVITAI_TOKEN"] = civitai_token
 
+    # Per-job subprocess timeout. Orchestrator passes `timeout_sec` based on
+    # the preset's disk_size_estimate_gb so large downloads aren't capped by
+    # an internal 10-minute hardcode. Falls back to 600s for callers
+    # (and legacy BlockFlow builds) that don't pass it.
+    raw_timeout = job_input.get("timeout_sec")
+    subprocess_timeout = max(int(raw_timeout) if raw_timeout else 600, 600)
+
     print(f"[job {job_id[:8]}] Download command: {len(downloads)} file(s)")
     results = []
 
@@ -348,7 +358,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
             if not version_id:
                 raise RuntimeError(f"Download {i+1}: 'version_id' required for civitai source")
             print(f"[job {job_id[:8]}] CivitAI download: version {version_id} -> {dest}")
-            info = _download_civitai(str(version_id), dest_dir)
+            info = _download_civitai(str(version_id), dest_dir, timeout_sec=subprocess_timeout)
             cached = False
 
         elif source == "url":
@@ -379,6 +389,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                     url, dest_dir, filename,
                     job=job, item_index=i, total_items=len(downloads),
                     progress_callback=progress_callback,
+                    timeout_sec=subprocess_timeout,
                 )
 
         else:
