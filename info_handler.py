@@ -12,6 +12,7 @@ import json
 import os
 import urllib.request
 
+import delete_handler
 import list_handler
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
@@ -50,10 +51,15 @@ def handle(job: dict) -> dict:
     Returns:
     {
         "ok": true,
+        "volume_root": "/runpod-volume",
         "samplers": ["euler", "euler_ancestral", ...],
         "schedulers": ["normal", "karras", ...],
         "loras": [{"filename": "...", "path": "...", "size_mb": ...}, ...]
     }
+
+    `volume_root` is the absolute path the worker mounts as the network volume
+    root. BlockFlow caches it (bead bmq.6 / B.3.1) and uses it to construct
+    model paths instead of hardcoding "/runpod-volume/ComfyUI/models/...".
     """
     try:
         object_info = _get_object_info()
@@ -71,6 +77,7 @@ def handle(job: dict) -> dict:
 
     return {
         "ok": True,
+        "volume_root": delete_handler.VOLUME_ROOT,
         "samplers": samplers,
         "schedulers": schedulers,
         "loras": loras,
