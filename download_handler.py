@@ -244,11 +244,21 @@ def _resolve_target(dl: dict) -> tuple[str, str]:
     - `dest` + (optional) `filename` (ComfyGen native — filename may be derived
       from the URL at download time when None)
     - `destination_path` (BlockFlow preset manifest synonym)
+
+    Defensive: if `dest` looks like a full file path (contains `/` and the
+    last segment has an extension) AND no explicit `filename` was provided,
+    interpret it as `destination_path` and split. Catches a foot-gun seen
+    in callers that conflate the two shapes — without this, dest_dir resolves
+    to an existing FILE and `os.makedirs(dest_dir, exist_ok=True)` raises
+    FileExistsError instead of dedup'ing against the cached file.
     """
     if "destination_path" in dl and dl["destination_path"]:
         return _split_destination_path(dl["destination_path"])
     dest = dl.get("dest", "checkpoints")
-    return dest, dl.get("filename")
+    filename = dl.get("filename")
+    if not filename and "/" in dest and "." in dest.rsplit("/", 1)[1]:
+        return _split_destination_path(dest)
+    return dest, filename
 
 
 def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -> dict:
