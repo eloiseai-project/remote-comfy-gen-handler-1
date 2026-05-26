@@ -11,12 +11,15 @@ preset stores file-relative paths under MODELS_BASE).
 from __future__ import annotations
 
 import json
+import re
 import urllib.request
 
 DEFAULT_MANIFEST_URL = (
     "https://raw.githubusercontent.com/Hearmeman24/blockflow-presets/main/manifest.json"
 )
 FETCH_TIMEOUT_SEC = 30
+
+_CIVITAI_VID_RE = re.compile(r"civitai\.com/api/download/models/(\d+)")
 
 
 def _fetch_json(url: str) -> dict:
@@ -38,13 +41,39 @@ def resolve_preset(preset_id: str, manifest_url: str = DEFAULT_MANIFEST_URL) -> 
 
 
 def preset_to_download_batch(preset: dict) -> list[dict]:
-    """Translate `preset.models` into the download_handler `downloads` shape."""
-    return [
-        {
-            "source": "url",
-            "url": m["url"],
-            "destination_path": m["dest"],
-            "sha256": m["sha256"],
-        }
-        for m in preset.get("models", [])
-    ]
+    """Translate `preset.models` into the download_handler `downloads` shape.
+
+    Default source is `url` (aria2c URL fetch). When a model declares
+    `source: 'civitai'`, the URL is parsed for its version_id and the entry is
+    rewritten into the authenticated CivitAI shape that `download_handler`
+    expects: `{source, version_id, dest, filename, sha256}`. The `filename`
+    field pins the on-disk name to what the workflow JSON references, since
+    CivitAI's filename-from-response is not always predictable.
+    """
+    out: list[dict] = []
+    for m in preset.get("models", []):
+        source = m.get("source", "url")
+        dest = m["dest"]
+        if source == "civitai":
+            mo = _CIVITAI_VID_RE.search(m["url"])
+            if not mo:
+                raise ValueError(
+                    f"civitai source for {dest!r} requires URL matching "
+                    f"civitai.com/api/download/models/<version_id>: got {m['url']!r}"
+                )
+            subfolder, _, filename = dest.partition("/")
+            out.append({
+                "source": "civitai",
+                "version_id": mo.group(1),
+                "dest": subfolder,
+                "filename": filename,
+                "sha256": m["sha256"],
+            })
+        else:
+            out.append({
+                "source": "url",
+                "url": m["url"],
+                "destination_path": dest,
+                "sha256": m["sha256"],
+            })
+    return out
