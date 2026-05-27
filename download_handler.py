@@ -26,6 +26,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable
 
@@ -136,6 +137,17 @@ def _sha256_file_with_heartbeat(
     return h.hexdigest()
 
 
+# Concurrency knobs. Sized for a CPU installer pod (2-4 CPU, 4-8GB RAM).
+# Each aria2c is configured for 8 connections per file, so 2 files in flight
+# = ~16 concurrent connections — safe for most networks and the network
+# volume's write bandwidth. Verify pool stays single-thread because hashing
+# competes for the same network-volume disk read bandwidth.
+DOWNLOAD_PARALLELISM = 2
+VERIFY_PARALLELISM = 1
+
+_PROGRESS_LOCK = threading.Lock()
+
+
 # Background pool for post-download sha256 verification. Single thread —
 # disk-bound, parallelism doesn't help and we don't want concurrent giant reads
 # competing on the network volume. Lazy-init so import-time stays cheap.
@@ -181,15 +193,19 @@ def _split_destination_path(destination_path: str) -> tuple[str, str]:
 
 
 def _send_progress(job: dict, message: str, percent: float = 0) -> None:
-    """Send a progress update to RunPod."""
-    try:
-        runpod.serverless.progress_update(job, {
-            "stage": "download",
-            "percent": round(percent, 1),
-            "message": message,
-        })
-    except Exception:
-        pass
+    """Send a progress update to RunPod. Serialized across worker threads —
+    runpod.serverless.progress_update isn't documented thread-safe and the UI
+    treats the latest message as authoritative anyway, so we don't want
+    interleaved partial writes."""
+    with _PROGRESS_LOCK:
+        try:
+            runpod.serverless.progress_update(job, {
+                "stage": "download",
+                "percent": round(percent, 1),
+                "message": message,
+            })
+        except Exception:
+            pass
 
 
 def _download_civitai(
@@ -627,10 +643,18 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
     raw_timeout = job_input.get("timeout_sec")
     subprocess_timeout = max(int(raw_timeout) if raw_timeout else 600, 600)
 
-    print(f"[job {job_id[:8]}] Download command: {len(downloads)} file(s)")
-    results = []
+    print(f"[job {job_id[:8]}] Download command: {len(downloads)} file(s) "
+          f"(parallelism: {DOWNLOAD_PARALLELISM} downloads × {VERIFY_PARALLELISM} verifier)")
 
-    for i, dl in enumerate(downloads):
+    # Parallel download. Each task is a closure that owns one spec end-to-end:
+    # announce → dedup → subprocess → record (CivitAI also kicks off an async
+    # verify on the verify pool — verification still completes serially via
+    # _pending_verifications). Results are returned via an index-keyed dict so
+    # the final order matches the input order even though completions are
+    # interleaved.
+    results_by_index: dict[int, dict] = {}
+
+    def _run_one(idx: int, dl: dict) -> dict:
         source = dl.get("source", "")
         # `huggingface` is a schema alias from blockflow-presets — functionally
         # an aria2c URL fetch, identical to source=`url`. Normalize at entry so
@@ -641,42 +665,39 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
         dest_dir = os.path.join(MODELS_BASE, dest)
         expected_sha = dl.get("sha256")
 
-        pct = (i / len(downloads)) * 100
-        _send_progress(job, f"Downloading {i+1}/{len(downloads)}", percent=pct)
+        pct = (idx / len(downloads)) * 100
+        _send_progress(job, f"Downloading {idx+1}/{len(downloads)}", percent=pct)
         if progress_callback:
-            # `file` resolved best-effort here so the SSE consumer sees the
-            # final filename even when civitai derives it post-download.
             announced_name = override_filename
             if source == "url" and not announced_name:
                 announced_name = (dl.get("url") or "").rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-            progress_callback({
-                "type": "download_start",
-                "file_index": i,
-                "file": announced_name or "",
-            })
+            with _PROGRESS_LOCK:
+                progress_callback({
+                    "type": "download_start",
+                    "file_index": idx,
+                    "file": announced_name or "",
+                })
 
         if source == "civitai":
             version_id = dl.get("version_id")
             if not version_id:
-                raise RuntimeError(f"Download {i+1}: 'version_id' required for civitai source")
+                raise RuntimeError(f"Download {idx+1}: 'version_id' required for civitai source")
             print(f"[job {job_id[:8]}] CivitAI download: version {version_id} -> {dest}")
             info = _download_civitai(
                 str(version_id), dest_dir,
                 timeout_sec=subprocess_timeout,
-                job=job, item_index=i, total_items=len(downloads),
+                job=job, item_index=idx, total_items=len(downloads),
                 progress_callback=progress_callback,
                 expected_sha=expected_sha,
             )
             cached = bool(info.pop("cached", False))
-            # When the dedup path served the file, record the API-reported sha
-            # on the result so the post-loop sha-verify branch sees it.
             if cached and "sha256" in info:
                 expected_sha = info["sha256"]
 
         elif source == "url":
             url = dl.get("url")
             if not url:
-                raise RuntimeError(f"Download {i+1}: 'url' required for url source")
+                raise RuntimeError(f"Download {idx+1}: 'url' required for url source")
             filename = override_filename
             if not filename:
                 filename = url.rstrip("/").rsplit("/", 1)[-1]
@@ -684,8 +705,6 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                     filename = filename.split("?")[0]
             target_path = os.path.join(dest_dir, filename)
 
-            # Content-addressable dedup: if a file already exists at the target
-            # with the expected hash, skip aria2c entirely.
             cached = False
             if expected_sha and os.path.isfile(target_path):
                 existing_sha = _sha256_file(target_path)
@@ -699,7 +718,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 print(f"[job {job_id[:8]}] URL download: {url} -> {dest}/{filename}")
                 info = _download_url(
                     url, dest_dir, filename,
-                    job=job, item_index=i, total_items=len(downloads),
+                    job=job, item_index=idx, total_items=len(downloads),
                     progress_callback=progress_callback,
                     timeout_sec=subprocess_timeout,
                     expected_sha=expected_sha,
@@ -707,23 +726,14 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
 
         else:
             raise RuntimeError(
-                f"Download {i+1}: unknown source '{dl.get('source','')}'. "
+                f"Download {idx+1}: unknown source '{dl.get('source','')}'. "
                 f"Use 'civitai', 'url', or 'huggingface' (alias for 'url').")
 
-        # Post-download sha256 verification — three paths:
-        #   (a) cached hit: dedup already proved the sha; record it, no work.
-        #   (b) URL/HF download with expected_sha: aria2c verified in-flight
-        #       via --checksum=sha-256=..., so a non-zero exit would have
-        #       blown up above. No second pass needed.
-        #   (c) CivitAI download with expected_sha: the wrapped script doesn't
-        #       expose a checksum kwarg, so the file needs a post-hash. We
-        #       submit it to a background pool and continue dispatching the
-        #       NEXT download immediately. Results awaited at the end of the
-        #       loop (bead 8r7 follow-up: async verify).
+        # sha256 settlement: cached → trust; URL with sha → aria2c verified
+        # in-flight; CivitAI with sha → async verify on the dedicated pool.
         if expected_sha and cached:
             info["sha256"] = expected_sha
         elif expected_sha and source == "url":
-            # aria2c --checksum already verified. Trust it.
             info["sha256"] = expected_sha.lower()
             print(f"[job {job_id[:8]}] sha256 verified in-flight (aria2c --checksum) for {info['filename']}", flush=True)
         elif expected_sha and source == "civitai":
@@ -734,25 +744,46 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 info["path"], expected_sha.lower(),
                 job_tag=job_id[:8], label=info["filename"],
             )
-            _pending_verifications.append((i, info, fut, expected_sha.lower()))
-            # info["sha256"] is filled in after the future resolves at the
-            # end of the loop. For now, mark it pending so callers can see.
+            _pending_verifications.append((idx, info, fut, expected_sha.lower()))
             info["sha256_pending"] = True
 
         info["dest"] = dest
         info["cached"] = cached
         info["bytes"] = os.path.getsize(info["path"])
-        results.append(info)
         print(f"[job {job_id[:8]}] Downloaded: {info['filename']} ({info['size_mb']} MB, cached={cached})")
         if progress_callback:
-            progress_callback({
-                "type": "download_done",
-                "file_index": i,
-                "file": info["filename"],
-                "cached": cached,
-                "bytes": info["bytes"],
-                "sha256": info.get("sha256"),
-            })
+            with _PROGRESS_LOCK:
+                progress_callback({
+                    "type": "download_done",
+                    "file_index": idx,
+                    "file": info["filename"],
+                    "cached": cached,
+                    "bytes": info["bytes"],
+                    "sha256": info.get("sha256"),
+                })
+        return info
+
+    # Submit all specs; collect first exception (let already-running tasks
+    # finish so we don't waste partial bandwidth, but fail the job after).
+    with ThreadPoolExecutor(
+        max_workers=DOWNLOAD_PARALLELISM, thread_name_prefix="dl-worker",
+    ) as pool:
+        future_to_idx = {pool.submit(_run_one, i, dl): i for i, dl in enumerate(downloads)}
+        first_error: BaseException | None = None
+        for fut in future_to_idx:
+            idx = future_to_idx[fut]
+            try:
+                results_by_index[idx] = fut.result()
+            except BaseException as exc:  # noqa: BLE001 — capture, re-raise after drain
+                if first_error is None:
+                    first_error = exc
+                print(f"[job {job_id[:8]}] Download {idx+1} failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+    if first_error is not None:
+        raise first_error
+
+    # Reassemble in input order so the response shape matches non-parallel runs.
+    results = [results_by_index[i] for i in range(len(downloads))]
 
     # Drain async sha256 verifications. The CivitAI path submits these to a
     # background pool so the next download can start immediately; we settle the
