@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable
 
@@ -333,6 +334,61 @@ def _parse_aria2c_progress(line: str) -> tuple[float, str] | None:
     return (pct, speed)
 
 
+def _kill_process(proc: subprocess.Popen) -> None:
+    """Best-effort process kill used when aria2c exceeds its timeout."""
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _stream_process_output(
+    proc: subprocess.Popen,
+    timeout_sec: float,
+    on_line: Callable[[str], None],
+) -> None:
+    """Stream process stdout while enforcing timeout even if stdout goes quiet.
+
+    Iterating directly over `proc.stdout` can block forever when a child process
+    hangs without emitting a newline. A reader thread owns that blocking read;
+    the caller thread watches the wall-clock deadline and kills the process on
+    expiry.
+    """
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=_reader, name="aria2c-output", daemon=True)
+    reader.start()
+
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process(proc)
+            raise subprocess.TimeoutExpired(
+                getattr(proc, "args", "aria2c"),
+                timeout_sec,
+            )
+        try:
+            item = output_queue.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if item is None:
+            return
+        on_line(item)
+
+
 def _download_url(
     url: str,
     dest_dir: str,
@@ -384,6 +440,13 @@ def _download_url(
         aria_cmd.extend(extra_aria_args)
     aria_cmd.append(url)
 
+    job_tag = (job.get("id", "")[:8] if job else "") or "download"
+    print(
+        f"[job {job_tag}] aria2c: starting {filename} "
+        f"(timeout={timeout_sec}s, checksum={bool(expected_sha)})",
+        flush=True,
+    )
+
     # Stream aria2c output to capture real-time progress
     proc = subprocess.Popen(
         aria_cmd,
@@ -394,39 +457,52 @@ def _download_url(
 
     output_lines = []
     last_progress_time = 0
-    try:
-        for line in proc.stdout:
-            output_lines.append(line)
-            parsed = _parse_aria2c_progress(line)
-            if parsed and job:
-                dl_pct, speed = parsed
-                now = time.time()
-                # Throttle progress updates to every 3 seconds
-                if now - last_progress_time >= 3:
-                    last_progress_time = now
-                    # Map download progress into the overall batch progress
-                    base_pct = (item_index / total_items) * 100
-                    item_pct = (dl_pct / 100) * (100 / total_items)
-                    overall_pct = base_pct + item_pct
-                    speed_str = f" ({speed}/s)" if speed else ""
-                    _send_progress(
-                        job,
-                        f"Downloading {item_index+1}/{total_items}: "
-                        f"{filename} {dl_pct}%{speed_str}",
-                        percent=overall_pct,
-                    )
-                    if progress_callback:
-                        progress_callback({
-                            "type": "download_progress",
-                            "file_index": item_index,
-                            "file": filename,
-                            "percent": dl_pct,
-                            "speed": speed or "",
-                        })
-    except Exception:
-        pass
 
-    proc.wait(timeout=timeout_sec)
+    def _handle_output_line(line: str) -> None:
+        nonlocal last_progress_time
+        output_lines.append(line)
+        parsed = _parse_aria2c_progress(line)
+        if parsed and job:
+            dl_pct, speed = parsed
+            now = time.time()
+            # Throttle progress updates to every 3 seconds
+            if now - last_progress_time >= 3:
+                last_progress_time = now
+                # Map download progress into the overall batch progress
+                base_pct = (item_index / total_items) * 100
+                item_pct = (dl_pct / 100) * (100 / total_items)
+                overall_pct = base_pct + item_pct
+                speed_str = f" ({speed}/s)" if speed else ""
+                _send_progress(
+                    job,
+                    f"Downloading {item_index+1}/{total_items}: "
+                    f"{filename} {dl_pct}%{speed_str}",
+                    percent=overall_pct,
+                )
+                if progress_callback:
+                    progress_callback({
+                        "type": "download_progress",
+                        "file_index": item_index,
+                        "file": filename,
+                        "percent": dl_pct,
+                        "speed": speed or "",
+                    })
+
+    try:
+        _stream_process_output(proc, timeout_sec, _handle_output_line)
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process(proc)
+        filepath = os.path.join(dest_dir, filename)
+        try:
+            os.unlink(filepath)
+        except OSError:
+            pass
+        partial_output = "".join(output_lines).strip()
+        detail = f": {partial_output}" if partial_output else ""
+        raise RuntimeError(
+            f"aria2c download timed out after {timeout_sec}s for {filename}{detail}"
+        ) from exc
 
     filepath = os.path.join(dest_dir, filename)
     if proc.returncode != 0:
