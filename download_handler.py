@@ -4,14 +4,18 @@ Handles two download sources:
 - CivitAI: Uses download_with_aria.py with a model version ID
 - Direct URL: Uses aria2c to download from any URL (HuggingFace, etc.)
 
-Files are downloaded to /runpod-volume/ComfyUI/models/<dest>/.
+Files are downloaded to MODELS_BASE/<dest/>. Serverless workers normally use
+/runpod-volume/ComfyUI/models; CPU installer pods use /workspace/ComfyUI/models.
 
 SHA256 verification + content-addressable dedup:
 Each entry may include an optional `sha256` field. When present:
-- If a file already exists at the destination and its hash matches, the
-  download is skipped and the result includes `cached: true`.
-- Otherwise the file is downloaded and its hash verified post-download. On
-  mismatch the corrupt file is deleted and the job fails.
+- If a file already exists at the destination and the persisted hash cache says
+  its size+mtime still match the expected SHA, the download is skipped without
+  reading the file.
+- If the cache is absent or stale, one existing destination file may still be
+  hashed as the compatibility fallback.
+- Otherwise the file is downloaded with aria2c --checksum. After success, the
+  expected SHA is persisted to the hash cache without a post-download read.
 
 `destination_path` may be used as a synonym for `dest` + `filename`. It is a
 relative path under MODELS_BASE — e.g. `"loras/sub/m.safetensors"` resolves to
@@ -33,7 +37,42 @@ from typing import Callable
 
 import runpod
 
-MODELS_BASE = "/runpod-volume/ComfyUI/models"
+
+def _default_models_base() -> str:
+    """Return the default model root for the current RunPod runtime layout."""
+    runpod_models = "/runpod-volume/ComfyUI/models"
+    workspace_models = "/workspace/ComfyUI/models"
+    if os.path.isdir(workspace_models) and not os.path.exists("/runpod-volume"):
+        return workspace_models
+    return runpod_models
+
+
+def _hash_cache_path_for_models_base(models_base: str) -> str:
+    """Return the persistent hash-cache path for a model root.
+
+    Serverless workers mount the volume at /runpod-volume. CPU install pods
+    mount the same volume at /workspace. The cache must live at the volume root
+    in both cases so both install modes can share it.
+    """
+    normalized = os.path.abspath(models_base)
+    for root in ("/runpod-volume", "/workspace"):
+        if normalized == root or normalized.startswith(root + os.sep):
+            return os.path.join(root, ".model-hash-cache.json")
+    if (
+        os.path.basename(normalized) == "models"
+        and os.path.basename(os.path.dirname(normalized)) == "ComfyUI"
+    ):
+        volume_root = os.path.dirname(os.path.dirname(normalized))
+    else:
+        volume_root = os.path.dirname(normalized)
+    return os.path.join(volume_root, ".model-hash-cache.json")
+
+
+MODELS_BASE = os.environ.get("COMFY_GEN_MODELS_BASE") or _default_models_base()
+HASH_CACHE_PATH = (
+    os.environ.get("COMFY_GEN_HASH_CACHE_PATH")
+    or _hash_cache_path_for_models_base(MODELS_BASE)
+)
 CIVITAI_SCRIPT = "/tools/civitai-downloader/download_with_aria.py"
 CIVITAI_API_BASE = "https://civitai.com/api/v1"
 CIVITAI_DOWNLOAD_BASE = "https://civitai.com/api/download/models"
@@ -148,8 +187,11 @@ def _find_file_by_sha(dest_dir: str, expected_sha: str, hint_name: str | None = 
     candidate = os.path.join(dest_dir, hint_name)
     if not os.path.isfile(candidate):
         return None
+    if _hash_cache_matches(candidate, expected_sha):
+        return candidate
     try:
         if _sha256_file(candidate) == expected_sha.lower():
+            _record_hash_cache(candidate, expected_sha)
             return candidate
     except OSError:
         pass
@@ -199,6 +241,69 @@ DOWNLOAD_PARALLELISM = 2
 VERIFY_PARALLELISM = 1
 
 _PROGRESS_LOCK = threading.Lock()
+_HASH_CACHE_LOCK = threading.Lock()
+_hash_cache: dict[str, dict] = {}
+
+
+def _load_hash_cache() -> None:
+    """Load persisted model hash metadata used for download dedup."""
+    global _hash_cache
+    try:
+        with open(HASH_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        _hash_cache = data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        _hash_cache = {}
+
+
+def _save_hash_cache() -> None:
+    """Persist hash metadata atomically."""
+    tmp = HASH_CACHE_PATH + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(HASH_CACHE_PATH), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(_hash_cache, f)
+        os.replace(tmp, HASH_CACHE_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _hash_cache_matches(path: str, expected_sha: str) -> bool:
+    """Return True when cache proves path already has expected_sha."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    with _HASH_CACHE_LOCK:
+        entry = _hash_cache.get(path)
+    if not entry:
+        return False
+    return (
+        entry.get("sha256") == expected_sha.lower()
+        and entry.get("size") == st.st_size
+        and entry.get("mtime") == st.st_mtime
+    )
+
+
+def _record_hash_cache(path: str, sha256: str) -> None:
+    """Record a known-good SHA for path without re-reading the file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    with _HASH_CACHE_LOCK:
+        _hash_cache[path] = {
+            "sha256": sha256.lower(),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        }
+        _save_hash_cache()
+
+
+_load_hash_cache()
 
 
 # Background pool for post-download sha256 verification. Single thread —
@@ -582,6 +687,9 @@ def _download_url(
     if not os.path.isfile(filepath):
         raise RuntimeError(f"Download completed but file not found: {filepath}")
 
+    if expected_sha:
+        _record_hash_cache(filepath, expected_sha)
+
     size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
 
     return {
@@ -759,12 +867,19 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
 
             cached = False
             if expected_sha and os.path.isfile(target_path):
-                existing_sha = _sha256_file(target_path)
-                if existing_sha == expected_sha:
+                if _hash_cache_matches(target_path, expected_sha):
                     cached = True
                     size_mb = round(os.path.getsize(target_path) / (1024 * 1024), 1)
                     info = {"filename": filename, "path": target_path, "size_mb": size_mb}
-                    print(f"[job {job_id[:8]}] Cached: {filename} (sha256 match)")
+                    print(f"[job {job_id[:8]}] Cached: {filename} (sha256 cache match)")
+                else:
+                    existing_sha = _sha256_file(target_path)
+                    if existing_sha == expected_sha.lower():
+                        _record_hash_cache(target_path, expected_sha)
+                        cached = True
+                        size_mb = round(os.path.getsize(target_path) / (1024 * 1024), 1)
+                        info = {"filename": filename, "path": target_path, "size_mb": size_mb}
+                        print(f"[job {job_id[:8]}] Cached: {filename} (sha256 match)")
 
             if not cached:
                 print(f"[job {job_id[:8]}] URL download: {url} -> {dest}/{filename}")
