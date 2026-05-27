@@ -641,6 +641,21 @@ def _send_progress(job: dict, stage: str, message: str, percent: float = 0, **ex
         pass
 
 
+def _run_with_progress_result_grace(fn, job: dict) -> dict:
+    """Run a command handler and pause before returning to RunPod.
+
+    The RunPod SDK sends progress updates asynchronously. If the handler returns
+    immediately after its final progress_update, the progress POST can arrive
+    after the result POST and leave status stuck at IN_PROGRESS. Workflow jobs
+    already apply this workaround below; download jobs need it too because they
+    emit their own progress updates in download_handler.
+    """
+    try:
+        return fn(job)
+    finally:
+        time.sleep(1)
+
+
 def handler(job: dict) -> dict:
     """Process a ComfyUI workflow job.
 
@@ -681,7 +696,7 @@ def handler(job: dict) -> dict:
     command = job_input.get("command")
     if command == "download":
         import download_handler
-        return download_handler.handle(job)
+        return _run_with_progress_result_grace(download_handler.handle, job)
     if command == "list_models":
         import list_handler
         return list_handler.handle(job)
