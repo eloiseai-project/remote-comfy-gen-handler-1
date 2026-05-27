@@ -77,35 +77,27 @@ def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict
 def _find_file_by_sha(dest_dir: str, expected_sha: str, hint_name: str | None = None) -> str | None:
     """Return the path of a file under `dest_dir` whose SHA256 matches.
 
-    Tries `hint_name` first (1 hash op) when supplied — that's the common path
-    when the CivitAI API tells us the filename. Falls back to scanning every
-    regular file in the directory (excluding `.aria2` partials and dotfiles).
-    Returns None if no match.
+    Hash budget: at most ONE file. When `hint_name` is given, that's the only
+    file we check. With no hint and no expected size info, scanning every file
+    in dest_dir and hashing each is catastrophic — on a populated checkpoints/
+    on a network volume that's literally minutes of wall time per call (bead
+    cwt). Better to declare a miss and let the subprocess decide what to do.
+
+    The rare "same bytes, different filename" edge case is sacrificed for
+    predictable latency.
     """
     if not os.path.isdir(dest_dir):
         return None
-    expected_sha = expected_sha.lower()
-    if hint_name:
-        candidate = os.path.join(dest_dir, hint_name)
-        if os.path.isfile(candidate):
-            try:
-                if _sha256_file(candidate) == expected_sha:
-                    return candidate
-            except OSError:
-                pass
-    for name in sorted(os.listdir(dest_dir)):
-        if name.startswith(".") or name.endswith(".aria2"):
-            continue
-        if hint_name and name == hint_name:
-            continue  # already checked above
-        full = os.path.join(dest_dir, name)
-        if not os.path.isfile(full):
-            continue
-        try:
-            if _sha256_file(full) == expected_sha:
-                return full
-        except OSError:
-            continue
+    if not hint_name:
+        return None
+    candidate = os.path.join(dest_dir, hint_name)
+    if not os.path.isfile(candidate):
+        return None
+    try:
+        if _sha256_file(candidate) == expected_sha.lower():
+            return candidate
+    except OSError:
+        pass
     return None
 
 
