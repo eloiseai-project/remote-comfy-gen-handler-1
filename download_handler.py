@@ -36,14 +36,33 @@ import runpod
 MODELS_BASE = "/runpod-volume/ComfyUI/models"
 CIVITAI_SCRIPT = "/tools/civitai-downloader/download_with_aria.py"
 CIVITAI_API_BASE = "https://civitai.com/api/v1"
+CIVITAI_DOWNLOAD_BASE = "https://civitai.com/api/download/models"
+CIVITAI_METADATA_RETRIES = 3
+CIVITAI_METADATA_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
-def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict | None:
+class CivitaiMetadataError(RuntimeError):
+    """Raised when CivitAI model-version metadata cannot be resolved."""
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Return a compact HTTPError detail string, including response body."""
+    body = ""
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    detail = f"HTTP {exc.code} {exc.reason}"
+    if body:
+        detail = f"{detail}: {body[:500]}"
+    return detail
+
+
+def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict:
     """Look up a CivitAI model version's primary file metadata.
 
     Hits `GET /api/v1/model-versions/{version_id}` and returns
-    `{"filename": str, "sha256": str}` for the primary file, or None if the
-    call fails, the version isn't published, or no SHA256 hash is reported.
+    `{"filename": str, "sha256": str}` for the primary file.
 
     Used to skip the download subprocess when a file with the expected hash
     already lives on the network volume — same content-addressable dedup the
@@ -56,17 +75,33 @@ def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as exc:
+
+    last_error = "unknown error"
+    for attempt in range(1, CIVITAI_METADATA_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = _http_error_detail(exc)
+            retryable = exc.code in CIVITAI_METADATA_RETRY_STATUSES
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+
+        if retryable and attempt < CIVITAI_METADATA_RETRIES:
+            print(f"[civitai] version-metadata lookup failed for {version_id} "
+                  f"(attempt {attempt}/{CIVITAI_METADATA_RETRIES}): "
+                  f"{last_error}; retrying", flush=True)
+            time.sleep(min(2 ** (attempt - 1), 4))
+            continue
         print(f"[civitai] version-metadata lookup failed for {version_id}: "
-              f"{type(exc).__name__}: {exc}", flush=True)
-        return None
+              f"{last_error}", flush=True)
+        raise CivitaiMetadataError(last_error)
 
     files = data.get("files") or []
     if not files:
-        return None
+        raise CivitaiMetadataError("response did not include files[]")
     # Prefer the explicitly-primary file; otherwise the first one. This is
     # the same file the wrapped download_with_aria.py script would pick.
     primary = next((f for f in files if f.get("primary")), files[0])
@@ -76,7 +111,17 @@ def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict
     # downloadUrl (CivitAI exposes both in different shapes).
     download_url = primary.get("downloadUrl") or data.get("downloadUrl")
     if not sha or not name or not download_url:
-        return None
+        missing = [
+            key for key, value in (
+                ("files[].name", name),
+                ("files[].hashes.SHA256", sha),
+                ("downloadUrl", download_url),
+            )
+            if not value
+        ]
+        raise CivitaiMetadataError(
+            f"response missing required metadata: {', '.join(missing)}"
+        )
     return {
         "filename": name,
         "sha256": sha.lower(),
@@ -225,6 +270,7 @@ def _download_civitai(
     total_items: int = 1,
     progress_callback: Callable[[dict], None] | None = None,
     expected_sha: str | None = None,
+    fallback_filename: str | None = None,
 ) -> dict:
     """Download a CivitAI model directly via aria2c, with in-flight checksum.
 
@@ -243,11 +289,29 @@ def _download_civitai(
     os.makedirs(dest_dir, exist_ok=True)
 
     token = os.environ.get("CIVITAI_TOKEN") or None
-    meta = _civitai_version_metadata(version_id, token=token)
+    try:
+        meta = _civitai_version_metadata(version_id, token=token)
+    except CivitaiMetadataError as exc:
+        if not (expected_sha and fallback_filename):
+            raise RuntimeError(
+                f"CivitAI API metadata lookup failed for version {version_id}: {exc}"
+            ) from exc
+        print(
+            f"[job {job_tag}] civitai: metadata lookup failed for version "
+            f"{version_id}: {exc}; using caller filename+sha fallback",
+            flush=True,
+        )
+        meta = {
+            "filename": fallback_filename,
+            "sha256": expected_sha.lower(),
+            "download_url": f"{CIVITAI_DOWNLOAD_BASE}/{version_id}",
+        }
     if meta is None:
+        # Test doubles and older local callers may still use None to represent
+        # lookup failure. Keep a clear failure rather than crashing on indexing.
         raise RuntimeError(
-            f"CivitAI API metadata lookup failed for version {version_id}. "
-            f"Verify CIVITAI_TOKEN is set if the model is gated."
+            f"CivitAI API metadata lookup failed for version {version_id}: "
+            "no metadata returned"
         )
     api_filename = meta["filename"]
     api_sha = meta["sha256"]
@@ -676,6 +740,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 job=job, item_index=idx, total_items=len(downloads),
                 progress_callback=progress_callback,
                 expected_sha=expected_sha,
+                fallback_filename=override_filename,
             )
             cached = bool(info.pop("cached", False))
             if cached and "sha256" in info:
