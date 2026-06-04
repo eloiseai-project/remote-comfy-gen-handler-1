@@ -1,7 +1,8 @@
 """Download handler for model files on RunPod serverless workers.
 
 Handles two download sources:
-- CivitAI: Uses download_with_aria.py with a model version ID
+- CivitAI: Resolves model-version metadata, then downloads the signed file URL
+  with aria2c
 - Direct URL: Uses aria2c to download from any URL (HuggingFace, etc.)
 
 Files are downloaded to MODELS_BASE/<dest/>. Serverless workers normally use
@@ -29,6 +30,7 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import threading
 import queue
@@ -73,7 +75,6 @@ HASH_CACHE_PATH = (
     os.environ.get("COMFY_GEN_HASH_CACHE_PATH")
     or _hash_cache_path_for_models_base(MODELS_BASE)
 )
-CIVITAI_SCRIPT = "/tools/civitai-downloader/download_with_aria.py"
 CIVITAI_API_BASE = "https://civitai.com/api/v1"
 CIVITAI_DOWNLOAD_BASE = "https://civitai.com/api/download/models"
 CIVITAI_METADATA_RETRIES = 3
@@ -82,6 +83,13 @@ CIVITAI_METADATA_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 
 class CivitaiMetadataError(RuntimeError):
     """Raised when CivitAI model-version metadata cannot be resolved."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib opener policy that exposes redirect Location headers."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -95,6 +103,38 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     if body:
         detail = f"{detail}: {body[:500]}"
     return detail
+
+
+def _resolve_civitai_download_url(download_url: str, token: str | None = None) -> str:
+    """Return the signed file URL behind a CivitAI download endpoint.
+
+    CivitAI accepts auth on `/api/download/models/{version_id}` and usually
+    returns a redirect to a signed `b2.civitai.com` URL. Do the authenticated
+    hop in Python so aria2c downloads the signed file URL without forwarding a
+    bearer Authorization header to the redirected host.
+    """
+    headers = {"User-Agent": "comfy-gen-handler/0.2"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(download_url, headers=headers)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=20):
+            return download_url
+    except urllib.error.HTTPError as exc:
+        if exc.code in {301, 302, 303, 307, 308}:
+            location = exc.headers.get("Location")
+            if location:
+                return urllib.parse.urljoin(download_url, location)
+        raise RuntimeError(
+            f"CivitAI download URL resolution failed for {download_url}: "
+            f"{_http_error_detail(exc)}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"CivitAI download URL resolution failed for {download_url}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _civitai_version_metadata(version_id: str, token: str | None = None) -> dict:
@@ -450,15 +490,14 @@ def _download_civitai(
             "sha256": effective_sha,
         }
 
-    # Cache miss — direct aria2c with in-flight --checksum. Auth header is
-    # added when CIVITAI_TOKEN is set (gated models). Reuses _download_url's
-    # streaming progress + retry semantics.
-    extra_args: list[str] = []
-    if token:
-        extra_args.append(f"--header=Authorization: Bearer {token}")
+    # Cache miss — resolve the authenticated CivitAI endpoint to its signed
+    # backing file URL, then let aria2c fetch that URL without forwarding the
+    # bearer token across hosts. B2 signed URLs can reject an extra
+    # Authorization header with HTTP 403.
+    resolved_download_url = _resolve_civitai_download_url(download_url, token=token)
 
     info = _download_url(
-        url=download_url,
+        url=resolved_download_url,
         dest_dir=dest_dir,
         filename=api_filename,
         job=job,
@@ -467,7 +506,7 @@ def _download_civitai(
         progress_callback=progress_callback,
         timeout_sec=timeout_sec,
         expected_sha=effective_sha,
-        extra_aria_args=extra_args,
+        extra_aria_args=[],
     )
     # aria2c --checksum verified in-flight, so we can record the sha now
     # without a second pass over the file.
