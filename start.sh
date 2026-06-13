@@ -93,6 +93,15 @@ elif [ ! -d "$EROS_CN/ComfyUI-LTXVideo" ]; then
     [ -f "$EROS_CN/ComfyUI-LTXVideo/requirements.txt" ] && pip install -q -r "$EROS_CN/ComfyUI-LTXVideo/requirements.txt" 2>/dev/null || true
 fi
 
+# --- Higgs v3 TTS nodes (Saganaki22) for ON-WORKER voice cloning (no local Mac load) ---
+# HiggsV3LoadModel / HiggsV3VoiceClone / HiggsV3Generate. Model auto-downloads to
+# models/higgsv3tts (on the volume, persists). Niche repo -> clone at boot.
+if [ ! -d "$EROS_CN/Higgs_v3-TTS-ComfyUI" ]; then
+    echo "[start][higgs] cloning Saganaki22/Higgs_v3-TTS-ComfyUI..."
+    git clone --depth 1 https://github.com/Saganaki22/Higgs_v3-TTS-ComfyUI.git "$EROS_CN/Higgs_v3-TTS-ComfyUI" 2>&1 | tail -2
+    [ -f "$EROS_CN/Higgs_v3-TTS-ComfyUI/requirements.txt" ] && pip install -q -r "$EROS_CN/Higgs_v3-TTS-ComfyUI/requirements.txt" 2>/dev/null || true
+fi
+
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
 # Experimental performance flags (enable via EXPERIMENTAL=true env var)
