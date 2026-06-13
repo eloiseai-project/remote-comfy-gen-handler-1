@@ -253,7 +253,8 @@ def collect_outputs(history: dict, output_dir: str) -> dict:
     videos = []
 
     VIDEO_EXTS = (".mp4", ".webm", ".avi", ".mov", ".mkv", ".gif")
-    OUTPUT_KEYS = ("images", "gifs", "videos")
+    AUDIO_EXTS = (".mp3", ".wav", ".flac", ".opus", ".m4a", ".ogg")
+    OUTPUT_KEYS = ("images", "gifs", "videos", "audio")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -272,7 +273,8 @@ def collect_outputs(history: dict, output_dir: str) -> dict:
                 size = _download_output(fname, subfolder, ftype, local_path)
 
                 entry = {"path": local_path, "size_bytes": size, "filename": fname}
-                if any(fname.lower().endswith(ext) for ext in VIDEO_EXTS):
+                # audio (e.g. SaveAudioMP3) returned via the videos channel so it gets uploaded + a URL
+                if any(fname.lower().endswith(ext) for ext in (VIDEO_EXTS + AUDIO_EXTS)):
                     videos.append(entry)
                 else:
                     images.append(entry)
