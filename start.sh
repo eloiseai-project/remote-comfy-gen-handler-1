@@ -73,6 +73,26 @@ if trigger in src and "filename_list_cache" not in src:
 PYEOF
 fi
 
+# --- EROS: ensure TenStrip 10S nodes + up-to-date LTXVideo are present (idempotent) ---
+# His I2V_v3 TiledSampler workflow needs the 10S pack (LTXTiledSampler,
+# LTXLatentAnchorAware, LTXTextAttentionAmplifier, LTXLikenessGuide,
+# LTXVLatentUpsamplerTiled). Niche repo -> ComfyUI-Manager can't auto-resolve it,
+# so we clone it here at boot. Lives on the ephemeral image dir; re-runs each cold start.
+EROS_CN="$COMFYUI_DIR/custom_nodes"
+if [ ! -d "$EROS_CN/10S-Comfy-nodes" ]; then
+    echo "[start][eros] cloning TenStrip/10S-Comfy-nodes..."
+    git clone --depth 1 https://github.com/TenStrip/10S-Comfy-nodes.git "$EROS_CN/10S-Comfy-nodes" 2>&1 | tail -2
+    pip install -q mediapipe 2>/dev/null || true
+fi
+if [ -d "$EROS_CN/ComfyUI-LTXVideo/.git" ]; then
+    echo "[start][eros] updating ComfyUI-LTXVideo..."
+    git -C "$EROS_CN/ComfyUI-LTXVideo" pull --ff-only 2>&1 | tail -1 || true
+elif [ ! -d "$EROS_CN/ComfyUI-LTXVideo" ]; then
+    echo "[start][eros] cloning Lightricks/ComfyUI-LTXVideo..."
+    git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git "$EROS_CN/ComfyUI-LTXVideo" 2>&1 | tail -2
+    [ -f "$EROS_CN/ComfyUI-LTXVideo/requirements.txt" ] && pip install -q -r "$EROS_CN/ComfyUI-LTXVideo/requirements.txt" 2>/dev/null || true
+fi
+
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
 # Experimental performance flags (enable via EXPERIMENTAL=true env var)
