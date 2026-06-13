@@ -101,6 +101,13 @@ if [ ! -d "$EROS_CN/Higgs_v3-TTS-ComfyUI" ]; then
     git clone --depth 1 https://github.com/Saganaki22/Higgs_v3-TTS-ComfyUI.git "$EROS_CN/Higgs_v3-TTS-ComfyUI" 2>&1 | tail -2
     [ -f "$EROS_CN/Higgs_v3-TTS-ComfyUI/requirements.txt" ] && pip install -q -r "$EROS_CN/Higgs_v3-TTS-ComfyUI/requirements.txt" 2>/dev/null || true
 fi
+# The Higgs node hardcodes folder_paths.models_dir/higgsv3tts (= baked /ComfyUI/models/higgsv3tts),
+# but our staged model lives on the volume. Symlink the baked dir to the volume's higgsv3tts.
+HIGGS_VOL="$(dirname "$(dirname "$(find /runpod-volume -maxdepth 7 -name '10Eros_fp8mixed.safetensors' 2>/dev/null | head -1)")")/higgsv3tts"
+if [ -d "$HIGGS_VOL" ] && [ ! -e "$COMFYUI_DIR/models/higgsv3tts" ]; then
+    echo "[start][higgs] symlinking higgsv3tts -> $HIGGS_VOL"
+    ln -s "$HIGGS_VOL" "$COMFYUI_DIR/models/higgsv3tts"
+fi
 
 # --- Start ComfyUI, tee output to log file for IMPORT FAILED detection ---
 cd "$COMFYUI_DIR"
